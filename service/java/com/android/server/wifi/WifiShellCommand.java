@@ -18,15 +18,24 @@ package com.android.server.wifi;
 
 import android.app.AppGlobals;
 import android.content.pm.IPackageManager;
+import android.net.wifi.ScanResult;
+import android.net.wifi.WifiConfiguration;
+import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiScanner;
 import android.os.Binder;
+import android.os.Process;
 import android.os.ShellCommand;
 
 import com.android.server.wifi.util.ApConfigUtil;
 
 import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -54,6 +63,8 @@ public class WifiShellCommand extends ShellCommand {
     private final WifiNative mWifiNative;
     private final HostapdHal mHostapdHal;
     private final WifiCountryCode mWifiCountryCode;
+    private final WifiScanner mWifiScanner;
+    private volatile List<ScanResult> mScanResults;
 
     WifiShellCommand(WifiInjector wifiInjector) {
         mClientModeImpl = wifiInjector.getClientModeImpl();
@@ -64,6 +75,7 @@ public class WifiShellCommand extends ShellCommand {
         mHostapdHal = wifiInjector.getHostapdHal();
         mWifiNative = wifiInjector.getWifiNative();
         mWifiCountryCode = wifiInjector.getWifiCountryCode();
+        mWifiScanner = wifiInjector.getWifiScanner();
     }
 
     @Override
@@ -245,6 +257,21 @@ public class WifiShellCommand extends ShellCommand {
                             + mWifiCountryCode.getCountryCode());
                     return 0;
                 }
+                case "connect-network": {
+                    return connectNetwork();
+                }
+                case "scan": {
+                    return scan();
+                }
+                case "list-scan-results": {
+                    return listScanResults();
+                }
+                case "disconnect": {
+                    return disconnect();
+                }
+                case "status": {
+                    return status();
+                }
                 default:
                     return handleDefaultCommands(cmd);
             }
@@ -253,6 +280,50 @@ public class WifiShellCommand extends ShellCommand {
             e.printStackTrace(pw);
         }
         return -1;
+    }
+
+    /**
+     * Backport of the Android 11 {@code cmd wifi connect-network} command.
+     *
+     * The framework still owns the connection: this only saves the network and
+     * asks ClientModeImpl to connect, so DHCP, DNS and the network agent stay
+     * with the framework.
+     */
+    private int connectNetwork() {
+        final PrintWriter pw = getOutPrintWriter();
+        String ssid = getNextArgRequired();
+        String type = getNextArgRequired();
+        String passphrase = null;
+        if ("wpa2".equals(type) || "wpa3".equals(type)) {
+            passphrase = getNextArgRequired();
+        } else if (!"open".equals(type)) {
+            pw.println("Invalid network type: " + type + " (expected open, wpa2 or wpa3)");
+            return -1;
+        }
+
+        WifiConfiguration config = new WifiConfiguration();
+        config.SSID = "\"" + ssid + "\"";
+        if (passphrase == null) {
+            config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+        } else {
+            config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK);
+            config.preSharedKey = "\"" + passphrase + "\"";
+        }
+
+        NetworkUpdateResult result =
+                mWifiConfigManager.addOrUpdateNetwork(config, Process.SHELL_UID);
+        if (!result.isSuccess()) {
+            pw.println("Failed to add/update network " + ssid);
+            return -1;
+        }
+        int networkId = result.getNetworkId();
+        if (!mWifiConfigManager.enableNetwork(networkId, true, Process.SHELL_UID)) {
+            pw.println("Failed to enable network " + ssid);
+            return -1;
+        }
+        mClientModeImpl.startConnectToNetwork(networkId, Process.SHELL_UID, null);
+        pw.println("Connecting to " + ssid + " (networkId=" + networkId + ")");
+        return 0;
     }
 
     private int sendLinkProbe(PrintWriter pw) throws InterruptedException {
@@ -308,6 +379,111 @@ public class WifiShellCommand extends ShellCommand {
         throw new SecurityException("Uid " + uid + " does not have access to wifi commands");
     }
 
+    private int scan() {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final WifiScanner.ScanListener listener = new WifiScanner.ScanListener() {
+            @Override
+            public void onSuccess() {
+            }
+
+            @Override
+            public void onFailure(int reason, String description) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onResults(WifiScanner.ScanData[] results) {
+                if (results != null && results.length > 0) {
+                    mScanResults = Arrays.asList(results[0].getResults());
+                }
+                latch.countDown();
+            }
+
+            @Override
+            public void onFullResult(ScanResult fullScanResult) {
+            }
+
+            @Override
+            public void onPeriodChanged(int periodInMs) {
+            }
+        };
+        final WifiScanner.ScanSettings settings = new WifiScanner.ScanSettings();
+        settings.band = WifiScanner.WIFI_BAND_BOTH_WITH_DFS;
+        mWifiScanner.startScan(settings, listener);
+        try {
+            latch.await(15, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return listScanResults();
+    }
+
+    private int listScanResults() {
+        final PrintWriter pw = getOutPrintWriter();
+        final List<ScanResult> results = mScanResults;
+        if (results == null || results.isEmpty()) {
+            pw.println("no networks found");
+            return 0;
+        }
+        final List<ScanResult> sorted = new ArrayList<>(results);
+        Collections.sort(sorted, new Comparator<ScanResult>() {
+            @Override
+            public int compare(ScanResult left, ScanResult right) {
+                return right.level - left.level;
+            }
+        });
+        for (ScanResult result : sorted) {
+            final String ssid = result.SSID == null || result.SSID.isEmpty()
+                    ? "<hidden>" : result.SSID;
+            pw.println(String.format("%-24s %4d dBm  %s",
+                    ssid, result.level, securityOf(result)));
+        }
+        return 0;
+    }
+
+    private static String securityOf(ScanResult result) {
+        final String caps = result.capabilities;
+        if (caps == null) {
+            return "open";
+        }
+        if (caps.contains("WPA3")) {
+            return "WPA3";
+        }
+        if (caps.contains("WPA2")) {
+            return "WPA2";
+        }
+        if (caps.contains("WPA")) {
+            return "WPA";
+        }
+        if (caps.contains("WEP")) {
+            return "WEP";
+        }
+        return "open";
+    }
+
+    private int disconnect() {
+        mClientModeImpl.disconnectCommand();
+        getOutPrintWriter().println("disconnected");
+        return 0;
+    }
+
+    private int status() {
+        final PrintWriter pw = getOutPrintWriter();
+        final WifiInfo info = mClientModeImpl.getWifiInfo();
+        if (info == null || info.getNetworkId() == WifiConfiguration.INVALID_NETWORK_ID) {
+            pw.println("not connected");
+            return 0;
+        }
+        String ssid = info.getSSID();
+        if (ssid != null && ssid.length() > 1
+                && ssid.charAt(0) == '"' && ssid.charAt(ssid.length() - 1) == '"') {
+            ssid = ssid.substring(1, ssid.length() - 1);
+        }
+        pw.println("ssid  " + ssid);
+        pw.println("rssi  " + info.getRssi() + " dBm");
+        return 0;
+    }
+
     @Override
     public void onHelp() {
         final PrintWriter pw = getOutPrintWriter();
@@ -315,6 +491,16 @@ public class WifiShellCommand extends ShellCommand {
         pw.println("Wi-Fi (wifi) commands:");
         pw.println("  help");
         pw.println("    Print this help text.");
+        pw.println("  connect-network <ssid> open|wpa2|wpa3 [passphrase]");
+        pw.println("    Connect to the specified network.");
+        pw.println("  scan");
+        pw.println("    Scan for nearby networks and print them.");
+        pw.println("  list-scan-results");
+        pw.println("    Print the results of the last scan.");
+        pw.println("  disconnect");
+        pw.println("    Disconnect from the current network.");
+        pw.println("  status");
+        pw.println("    Print the current ssid and signal.");
         pw.println("  set-ipreach-disconnect enabled|disabled");
         pw.println("    Sets whether CMD_IP_REACHABILITY_LOST events should trigger disconnects.");
         pw.println("  get-ipreach-disconnect");
